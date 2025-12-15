@@ -79,6 +79,8 @@ func (h *WSHandler) HandleWebSocket(c *gin.Context) {
 			username = h.handleJoinMatchmaking(conn, socketID, wsMsg.Payload)
 		case models.WSMakeMove:
 			h.handleMakeMove(conn, username, wsMsg.Payload)
+		case models.WSReconnectGame:
+			h.handleReconnectGame(conn, username, wsMsg.Payload)
 		}
 	}
 }
@@ -227,6 +229,55 @@ func (h *WSHandler) handleMakeMove(conn *websocket.Conn, username string, payloa
 	}
 }
 
+func (h *WSHandler) handleReconnectGame(conn *websocket.Conn, username string, payload interface{}) {
+	gameState, err := h.reconnectionService.HandleReconnection(username)
+	if err != nil || gameState == nil {
+		h.sendError(conn, "Failed to reconnect to game")
+		return
+	}
+
+	h.connMutex.Lock()
+	h.connections[username] = conn
+	h.playerGames[username] = gameState.GameID
+	h.connMutex.Unlock()
+
+	var yourColor models.PlayerColor
+	var opponentName string
+	if gameState.Player1.Username == username {
+		yourColor = gameState.Player1.Color
+		opponentName = gameState.Player2.Username
+	} else {
+		yourColor = gameState.Player2.Color
+		opponentName = gameState.Player1.Username
+	}
+
+	h.sendMessage(conn, models.WSMessage{
+		Type: models.WSGameRestored,
+		Payload: map[string]interface{}{
+			"game_id":      gameState.GameID,
+			"board":        gameState.Board,
+			"current_turn": gameState.CurrentTurn,
+			"move_count":   gameState.MoveCount,
+			"your_color":   yourColor,
+			"opponent":     opponentName,
+		},
+	})
+
+	// Notify opponent
+	h.connMutex.RLock()
+	opponentConn := h.connections[opponentName]
+	h.connMutex.RUnlock()
+
+	if opponentConn != nil {
+		h.sendMessage(opponentConn, models.WSMessage{
+			Type: models.WSOpponentReconnected,
+			Payload: map[string]interface{}{
+				"message": username + " has reconnected",
+			},
+		})
+	}
+}
+
 func (h *WSHandler) handleDisconnection(username string) {
 	h.connMutex.Lock()
 	delete(h.connections, username)
@@ -243,6 +294,23 @@ func (h *WSHandler) handleDisconnection(username string) {
 				playerID = game.Player2.ID
 			}
 			h.reconnectionService.TrackDisconnection(username, playerID, gameID)
+
+			// Notify opponent
+			opponentUsername := game.Player2.Username
+			if username == game.Player2.Username {
+				opponentUsername = game.Player1.Username
+			}
+			h.connMutex.RLock()
+			opponentConn := h.connections[opponentUsername]
+			h.connMutex.RUnlock()
+			if opponentConn != nil {
+				h.sendMessage(opponentConn, models.WSMessage{
+					Type: models.WSOpponentDisconnected,
+					Payload: map[string]interface{}{
+						"time_remaining": 30,
+					},
+				})
+			}
 		}
 	} else {
 		h.matchmakingService.LeaveQueue(username)
@@ -250,11 +318,44 @@ func (h *WSHandler) handleDisconnection(username string) {
 }
 
 func (h *WSHandler) handleForfeit(gameID uuid.UUID, playerID int) {
-	// Notify opponent
+	game, err := h.gameService.GetGame(gameID)
+	if err != nil {
+		return
+	}
+
+	var winnerUsername string
+	var loserUsername string
+	if game.Player1.ID == playerID {
+		winnerUsername = game.Player2.Username
+		loserUsername = game.Player1.Username
+	} else {
+		winnerUsername = game.Player1.Username
+		loserUsername = game.Player2.Username
+	}
+
+	h.connMutex.RLock()
+	winnerConn := h.connections[winnerUsername]
+	h.connMutex.RUnlock()
+
+	if winnerConn != nil {
+		h.sendMessage(winnerConn, models.WSMessage{
+			Type: models.WSGameOver,
+			Payload: models.GameOverPayload{
+				Winner:   &winnerUsername,
+				Reason:   "forfeit",
+				Board:    game.Board,
+				Duration: 30,
+			},
+		})
+	}
+
+	logger.Log.Info("Game forfeited due to disconnect", zap.String("loser", loserUsername), zap.String("winner", winnerUsername))
 }
 
 func (h *WSHandler) handleReconnect(player *models.DisconnectedPlayer, gameState *models.GameState) {
-	// Handle reconnection
+	// This is called by reconnection service when player reconnects
+	// The actual reconnection handling is done in handleReconnectGame
+	logger.Log.Info("Player reconnected successfully", zap.String("username", player.Username))
 }
 
 func (h *WSHandler) sendMessage(conn *websocket.Conn, msg models.WSMessage) {
