@@ -128,3 +128,14 @@ func (d *Database) GetLeaderboard(limit int) ([]models.LeaderboardEntry, error) 
 	}
 	return entries, nil
 }
+func (d *Database) Exec(query string, args ...interface{}) (interface{}, error) {
+	return d.db.Exec(query, args...)
+}
+
+func (d *Database) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	return d.db.Query(query, args...)
+}
+
+func (d *Database) QueryRow(query string, args ...interface{}) *sql.Row {
+	return d.db.QueryRow(query, args...)
+}

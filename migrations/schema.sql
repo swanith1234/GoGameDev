@@ -99,3 +99,48 @@ CREATE TRIGGER trigger_update_player_stats
     WHEN (NEW.status IN ('completed', 'forfeited', 'draw') AND OLD.status = 'active')
     EXECUTE FUNCTION update_player_stats();
 
+
+-- Analytics tables for Kafka consumer
+CREATE TABLE IF NOT EXISTS game_analytics (
+    id SERIAL PRIMARY KEY,
+    game_id UUID REFERENCES games(id),
+    event_type VARCHAR(50) NOT NULL,
+    event_data JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS analytics_metrics (
+    id SERIAL PRIMARY KEY,
+    metric_name VARCHAR(100) NOT NULL,
+    metric_value NUMERIC,
+    metric_data JSONB,
+    calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_game_analytics_game_id ON game_analytics(game_id);
+CREATE INDEX idx_game_analytics_event_type ON game_analytics(event_type);
+CREATE INDEX idx_game_analytics_created_at ON game_analytics(created_at);
+CREATE INDEX idx_analytics_metrics_name ON analytics_metrics(metric_name);
+CREATE INDEX idx_analytics_metrics_calculated ON analytics_metrics(calculated_at);
+
+-- Materialized view for fast analytics queries
+CREATE MATERIALIZED VIEW IF NOT EXISTS analytics_summary AS
+SELECT 
+    DATE(started_at) as game_date,
+    COUNT(*) as total_games,
+    COUNT(*) FILTER (WHERE player2_is_bot = true) as bot_games,
+    COUNT(*) FILTER (WHERE status = 'completed') as completed_games,
+    COUNT(*) FILTER (WHERE status = 'draw') as draw_games,
+    AVG(duration_seconds) FILTER (WHERE duration_seconds IS NOT NULL) as avg_duration,
+    AVG(total_moves) as avg_moves
+FROM games
+GROUP BY DATE(started_at)
+ORDER BY game_date DESC;
+
+-- Function to refresh materialized view
+CREATE OR REPLACE FUNCTION refresh_analytics_summary()
+RETURNS void AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW analytics_summary;
+END;
+$$ LANGUAGE plpgsql;

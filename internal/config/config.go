@@ -8,11 +8,14 @@ import (
 
 	"github.com/joho/godotenv"
 )
+import "strings"
+
 
 type Config struct {
 	Server   ServerConfig
 	Database DatabaseConfig
 	Game     GameConfig
+	Kafka    KafkaConfig
 }
 
 type ServerConfig struct {
@@ -37,6 +40,14 @@ type GameConfig struct {
 	MatchmakingTimeout  int
 	ReconnectionTimeout int
 }
+type KafkaConfig struct {
+	Brokers     []string
+	TopicEvents string
+	Username    string
+	Password    string
+}
+
+
 
 func Load() (*Config, error) {
 	_ = godotenv.Load()
@@ -62,6 +73,13 @@ func Load() (*Config, error) {
 			MatchmakingTimeout:  getEnvAsInt("MATCHMAKING_TIMEOUT", 10),
 			ReconnectionTimeout: getEnvAsInt("RECONNECTION_TIMEOUT", 30),
 		},
+		Kafka: KafkaConfig{
+	Brokers:     strings.Split(getEnv("KAFKA_BROKERS", ""), ","),
+	TopicEvents: getEnv("KAFKA_TOPIC_EVENTS", "game.events"),
+	Username:    getEnv("KAFKA_USERNAME", ""),
+	Password:    getEnv("KAFKA_PASSWORD", ""),
+},
+
 	}
 
 	return config, nil

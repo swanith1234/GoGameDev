@@ -223,3 +223,63 @@ func (b *Board) Copy() Board {
 	}
 	return newBoard
 }
+// =======================
+// Kafka Event Models
+// =======================
+
+type KafkaEventType string
+
+const (
+	EventGameStarted   KafkaEventType = "GAME_STARTED"
+	EventMoveMade      KafkaEventType = "MOVE_MADE"
+	EventGameCompleted KafkaEventType = "GAME_COMPLETED"
+)
+
+type BaseEvent struct {
+	Type      KafkaEventType `json:"type"`
+	Timestamp time.Time      `json:"timestamp"`
+}
+
+// -----------------------
+// Game started event
+// -----------------------
+
+type GameStartedEvent struct {
+	BaseEvent
+
+	GameID uuid.UUID `json:"game_id"`
+
+	// analytics-friendly (used by GameService)
+	Player1 string  `json:"player1"`
+	Player2 string  `json:"player2,omitempty"`
+	IsBot   bool    `json:"is_bot"`
+}
+
+// -----------------------
+// Move made event
+// -----------------------
+
+type MoveMadeEvent struct {
+	BaseEvent
+
+	GameID uuid.UUID `json:"game_id"`
+
+	Player     string `json:"player"`
+	Column     int    `json:"column"`
+	MoveNumber int    `json:"move_number"`
+}
+
+// -----------------------
+// Game completed event
+// -----------------------
+
+type GameCompletedEvent struct {
+	BaseEvent
+
+	GameID uuid.UUID `json:"game_id"`
+
+	Winner     *string `json:"winner,omitempty"`
+	Reason     string  `json:"reason"`
+	Duration   int     `json:"duration_seconds"`
+	TotalMoves int     `json:"total_moves"`
+}

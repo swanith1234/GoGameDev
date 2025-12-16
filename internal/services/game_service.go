@@ -15,17 +15,19 @@ import (
 )
 
 type GameService struct {
-	db          *database.Database
-	activeGames map[uuid.UUID]*models.GameState
-	gamesMutex  sync.RWMutex
-	bot         *bot.Bot
+	db            *database.Database
+	activeGames   map[uuid.UUID]*models.GameState
+	gamesMutex    sync.RWMutex
+	bot           *bot.Bot
+	kafkaProducer *KafkaProducer
 }
 
-func NewGameService(db *database.Database) *GameService {
+func NewGameService(db *database.Database, kafkaProducer *KafkaProducer) *GameService {
 	return &GameService{
-		db:          db,
-		activeGames: make(map[uuid.UUID]*models.GameState),
-		bot:         bot.New(),
+		db:            db,
+		activeGames:   make(map[uuid.UUID]*models.GameState),
+		bot:           bot.New(),
+		kafkaProducer: kafkaProducer,
 	}
 }
 
@@ -55,13 +57,33 @@ func (gs *GameService) CreateGame(player1 models.PlayerInfo, player2 models.Play
 	gs.activeGames[dbGameID] = gameState
 	gs.gamesMutex.Unlock()
 
-	logger.Log.Info("Game created", zap.String("game_id", dbGameID.String()), zap.String("player1", player1.Username), zap.String("player2", player2.Username), zap.Bool("is_bot", player2.IsBot))
+	// Publish GAME_STARTED
+	if gs.kafkaProducer != nil {
+		event := models.GameStartedEvent{
+			BaseEvent: models.BaseEvent{
+				Type:      models.EventGameStarted,
+				Timestamp: time.Now(),
+			},
+			GameID:  dbGameID,
+			Player1: player1.Username,
+			Player2: player2.Username,
+			IsBot:   player2.IsBot,
+		}
+
+		if err := gs.kafkaProducer.PublishGameStarted(event); err != nil {
+			logger.Log.Error("Failed to publish game started event", zap.Error(err))
+		} else {
+			logger.Log.Info("📤 Published GAME_STARTED event", zap.String("game_id", dbGameID.String()))
+		}
+	}
+
 	return gameState, nil
 }
 
 func (gs *GameService) GetGame(gameID uuid.UUID) (*models.GameState, error) {
 	gs.gamesMutex.RLock()
 	defer gs.gamesMutex.RUnlock()
+
 	game, exists := gs.activeGames[gameID]
 	if !exists {
 		return nil, errors.New("game not found")
@@ -96,6 +118,7 @@ func (gs *GameService) MakeMove(gameID uuid.UUID, playerID int, column int) (*mo
 	if game.CurrentTurn == models.ColorYellow {
 		playerNum = 2
 	}
+
 	row := game.Board.DropDisc(column, playerNum)
 	if row == -1 {
 		return nil, nil, errors.New("failed to drop disc")
@@ -103,6 +126,24 @@ func (gs *GameService) MakeMove(gameID uuid.UUID, playerID int, column int) (*mo
 	game.MoveCount++
 
 	_ = gs.db.SaveGameMove(gameID, playerID, column, row, game.MoveCount)
+
+	// Publish MOVE_MADE
+	if gs.kafkaProducer != nil {
+		event := models.MoveMadeEvent{
+			BaseEvent: models.BaseEvent{
+				Type:      models.EventMoveMade,
+				Timestamp: time.Now(),
+			},
+			GameID:     gameID,
+			Player:     currentPlayer.Username,
+			Column:     column,
+			MoveNumber: game.MoveCount,
+		}
+
+		if err := gs.kafkaProducer.PublishMoveMade(event); err != nil {
+			logger.Log.Error("Failed to publish move event", zap.Error(err))
+		}
+	}
 
 	if game.Board.CheckWin(row, column) {
 		return gs.handleGameEnd(game, &currentPlayer.ID, "win", column, row, currentPlayer.Color)
@@ -125,6 +166,7 @@ func (gs *GameService) MakeMove(gameID uuid.UUID, playerID int, column int) (*mo
 		Board:      game.Board,
 		MoveNumber: game.MoveCount,
 	}
+
 	return movePayload, nil, nil
 }
 
@@ -155,6 +197,24 @@ func (gs *GameService) MakeBotMove(gameID uuid.UUID) (*models.MovePayload, *mode
 
 	_ = gs.db.SaveGameMove(gameID, game.Player2.ID, column, row, game.MoveCount)
 
+	// Publish BOT MOVE
+	if gs.kafkaProducer != nil {
+		event := models.MoveMadeEvent{
+			BaseEvent: models.BaseEvent{
+				Type:      models.EventMoveMade,
+				Timestamp: time.Now(),
+			},
+			GameID:     gameID,
+			Player:     "Bot",
+			Column:     column,
+			MoveNumber: game.MoveCount,
+		}
+
+		if err := gs.kafkaProducer.PublishMoveMade(event); err != nil {
+			logger.Log.Error("Failed to publish bot move event", zap.Error(err))
+		}
+	}
+
 	if game.Board.CheckWin(row, column) {
 		return gs.handleGameEnd(game, &game.Player2.ID, "win", column, row, game.Player2.Color)
 	}
@@ -172,20 +232,26 @@ func (gs *GameService) MakeBotMove(gameID uuid.UUID) (*models.MovePayload, *mode
 		Board:      game.Board,
 		MoveNumber: game.MoveCount,
 	}
+
 	return movePayload, nil, nil
 }
 
-func (gs *GameService) handleGameEnd(game *models.GameState, winnerID *int, reason string, column int, row int, color models.PlayerColor) (*models.MovePayload, *models.GameOverPayload, error) {
+func (gs *GameService) handleGameEnd(
+	game *models.GameState,
+	winnerID *int,
+	reason string,
+	column int,
+	row int,
+	color models.PlayerColor,
+) (*models.MovePayload, *models.GameOverPayload, error) {
+
 	completedAt := time.Now()
 	game.CompletedAt = &completedAt
 
-	var status models.GameStatus
 	if reason == "draw" {
-		status = models.GameStatusDraw
-		game.Status = status
-	} else if reason == "win" {
-		status = models.GameStatusCompleted
-		game.Status = status
+		game.Status = models.GameStatusDraw
+	} else {
+		game.Status = models.GameStatusCompleted
 		if winnerID != nil {
 			if *winnerID == game.Player1.ID {
 				game.Winner = &game.Player1.Username
@@ -193,12 +259,25 @@ func (gs *GameService) handleGameEnd(game *models.GameState, winnerID *int, reas
 				game.Winner = &game.Player2.Username
 			}
 		}
-	} else if reason == "forfeit" {
-		status = models.GameStatusForfeited
-		game.Status = status
 	}
 
-	_ = gs.db.CompleteGame(game.GameID, winnerID, status, game.MoveCount, game.StartedAt)
+	_ = gs.db.CompleteGame(game.GameID, winnerID, game.Status, game.MoveCount, game.StartedAt)
+
+	if gs.kafkaProducer != nil {
+		event := models.GameCompletedEvent{
+			BaseEvent: models.BaseEvent{
+				Type:      models.EventGameCompleted,
+				Timestamp: time.Now(),
+			},
+			GameID:     game.GameID,
+			Winner:     game.Winner,
+			Reason:     reason,
+			Duration:   int(completedAt.Sub(game.StartedAt).Seconds()),
+			TotalMoves: game.MoveCount,
+		}
+
+		_ = gs.kafkaProducer.PublishGameCompleted(event)
+	}
 
 	movePayload := &models.MovePayload{
 		Column:     column,
@@ -217,7 +296,6 @@ func (gs *GameService) handleGameEnd(game *models.GameState, winnerID *int, reas
 
 	return movePayload, gameOverPayload, nil
 }
-
 func (gs *GameService) ForfeitGame(gameID uuid.UUID, playerID int) error {
 	gs.gamesMutex.Lock()
 	defer gs.gamesMutex.Unlock()
@@ -244,6 +322,32 @@ func (gs *GameService) ForfeitGame(gameID uuid.UUID, playerID int) error {
 		game.Winner = &game.Player2.Username
 	}
 
-	_ = gs.db.CompleteGame(game.GameID, &winnerID, models.GameStatusForfeited, game.MoveCount, game.StartedAt)
+	_ = gs.db.CompleteGame(
+		game.GameID,
+		&winnerID,
+		models.GameStatusForfeited,
+		game.MoveCount,
+		game.StartedAt,
+	)
+
+	// Publish FORFEIT event
+	if gs.kafkaProducer != nil {
+		event := models.GameCompletedEvent{
+			BaseEvent: models.BaseEvent{
+				Type:      models.EventGameCompleted,
+				Timestamp: time.Now(),
+			},
+			GameID:     game.GameID,
+			Winner:     game.Winner,
+			Reason:     "forfeit",
+			Duration:   int(completedAt.Sub(game.StartedAt).Seconds()),
+			TotalMoves: game.MoveCount,
+		}
+
+		if err := gs.kafkaProducer.PublishGameCompleted(event); err != nil {
+			logger.Log.Error("Failed to publish forfeit event", zap.Error(err))
+		}
+	}
+
 	return nil
 }
